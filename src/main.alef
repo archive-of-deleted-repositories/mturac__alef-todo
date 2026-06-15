@@ -713,33 +713,30 @@ fn lib_team_members(db: Struct, team_id: string) {
         lib_fail("team_members: no such team '" + team_id + "'")
         return
     }
+    // v1.1.0-rc.1: build the array as an Alef value
+    // and let std.json.encode serialize it. Pre-
+    // rc.1, this function manually built a JSON
+    // string by appending `,` between hand-encoded
+    // struct strings — the same anti-pattern that
+    // `lib list` and the lib_ok envelope used to
+    // use, and which the v1.0.0-rc.2 dangling-else
+    // fix and the v1.1.0-rc.0 std.string import
+    // started to clear up. With std.array.filter
+    // + std.array.map the loop becomes a single
+    // pipeline.
     let prefix = "team_members." + team_id + "."
     let all = keys(db)
-    let result = "["
-    let first = true
+    let result = []
     for k in all {
         if starts_with(k, prefix) {
             let uid = k.slice(str_len(prefix), len(k))
             if has(db, "users." + uid) {
                 let u = get(db, "users." + uid)
                 let member = get(db, k)
-                let sep = ","
-                if first {
-        sep = ""
-        first = false
-    }
-                // We assemble the array element via
-                // std.json.encode, which handles all
-                // the escaping. The trick: the
-                // separator and the encoded object
-                // both come from string concat, so
-                // we never have a raw `{}` in
-                // source.
-                result = result + sep + encode(Struct { id: uid, name: u.name, role: member.role })
+                result.push(Struct { id: uid, name: u.name, role: member.role })
             }
         }
     }
-    result = result + "]"
     let env = Struct { ok: true, result: result }
     print(encode(env) + "\n")
 }
