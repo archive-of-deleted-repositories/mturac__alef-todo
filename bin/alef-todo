@@ -1,0 +1,16 @@
+#!/bin/sh
+# bin/alef-todo — invoke the Alef todo CLI without
+# typing `alef run` every time.
+#
+# Install:  cp bin/alef-todo /usr/local/bin/alef-todo
+# Or:        ln -s "$(pwd)/bin/alef-todo" /usr/local/bin/alef-todo
+# Or:        export PATH="$(pwd)/bin:$PATH"
+#
+# The wrapper shells out to `bin/alef`, which is
+# either the published Alef binary on $PATH or
+# the local alef shim. The user never types
+# `alef run` themselves.
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/alef" run "$SCRIPT_DIR/../src/main.alef" "$@"

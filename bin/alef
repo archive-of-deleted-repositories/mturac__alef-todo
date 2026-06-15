@@ -1,0 +1,31 @@
+#!/bin/sh
+# bin/alef — minimal shim for the bundled Alef CLI.
+#
+# Locates the Alef repo (defaults to
+# $ALEF_REPO, then ../aleflang, then a couple of
+# well-known paths) and runs its dist/cli.js under
+# node. The shim exists so the alef-todo wrapper
+# can exec `alef` without requiring a separate
+# install of the Alef toolchain.
+#
+# For users who already have `alef` on $PATH
+# (because they installed the published binary
+# via npm / Homebrew), this shim is bypassed in
+# favor of the system binary.
+
+set -e
+if command -v alef >/dev/null 2>&1; then
+    exec alef "$@"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The Alef repo is expected at the same parent dir
+# as alef-todo (e.g. ~/Projects/alef-todo and
+# ~/Projects/aleflang). Override via ALEF_REPO.
+REPO_ROOT="${ALEF_REPO:-$SCRIPT_DIR/../aleflang}"
+CLI="$REPO_ROOT/dist/cli.js"
+if [ ! -f "$CLI" ]; then
+    echo "alef: cannot locate CLI at $CLI" >&2
+    echo "  set ALEF_REPO to the path of the Alef repo" >&2
+    exit 127
+fi
+exec node "$CLI" "$@"

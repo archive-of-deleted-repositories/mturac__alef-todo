@@ -1,0 +1,1161 @@
+// src/main.alef — alef-todo: a multi-user, team-shared
+// CLI todo app. The app is written entirely in
+// Alef; only the stdlib primitives (PBKDF2 hashing,
+// atomic JSON write) are implemented in TypeScript
+// as Node bridges — the schema, ACL, business logic,
+// and CLI dispatch all live here.
+//
+// Persistence: $ALEF_TODO_DIR/db.json (defaults to
+// ~/.alef-todo/db.json). The on-disk format is a
+// flat JSON object with dotted keys:
+//
+//   "users.<id>"            -> {id, name, pass_hash}
+//   "users_by_name.<name>"  -> <id>          (unique-name index)
+//   "tokens.<token>"        -> <user_id>     (session tokens)
+//   "teams.<id>"            -> {id, name, owner_id}
+//   "teams_by_name.<name>"  -> <id>          (unique-name index)
+//   "team_members.<team>.<user>" -> {role}
+//   "todos.<id>"            -> {id, owner_id, team_id?, text, done, due?, created_at}
+//   "shares.<todo>.<user>"  -> {}            (presence == "shared with")
+//
+// We index by name so register/team create can fail
+// fast on duplicates without scanning every user.
+// The tokens map gives us a one-shot auth handle
+// for the CLI: the user logs in once per session,
+// the wrapper writes a session file, and subsequent
+// invocations read the token and resolve to a user
+// id from the tokens map.
+//
+// ACL rules:
+//   - a user always sees their own todos.
+//   - a user sees any todo with team_id where they
+//     are a team member.
+//   - a user sees any todo where they appear in
+//     `shares` (explicit per-user share).
+//   - "done" / "remove" require ownership OR team
+//     membership (if the todo is a team todo).
+//   - "share" requires ownership.
+//
+// CLI:
+//   register <name> <password>
+//   login <name> <password>
+//   logout
+//   whoami
+//   team create <name>
+//   team members <team_id>
+//   team join <team_id>          (join a team — any user can join any team in v1)
+//   add <text> [--team <team_id>]
+//   list [--team <team_id>] [--all]
+//   done <id>
+//   remove <id>
+//   share <todo_id> <user_id>
+//   help
+//
+// The `bin/alef-todo` shell wrapper invokes this
+// file via the bundled interpreter, so the user
+// never has to type `alef run` themselves.
+
+import std.process { argv, exit }
+import std.os { env }
+import std.fs { exists, read, write }
+import std.json { encode, decode }
+import std.crypto { hash_password, verify_password, random_id }
+import std.db { store, get, set, has, delete, keys, close }
+
+// ---------- path / session ----------
+
+fn str_len(s: string) -> int {
+    let n = 0
+    for c in s { n = n + 1 }
+    return n
+}
+
+fn join_args(a: [string], start: int, end: int) -> string {
+    let out = ""
+    let first = true
+    let i = start
+    while i < end {
+        if not first {
+            out = out + " "
+        }
+        out = out + a[i]
+        first = false
+        i = i + 1
+    }
+    return out
+}
+
+fn argv_len(a: [string]) -> int {
+    let n = 0
+    for x in a { n = n + 1 }
+    return n
+}
+
+fn db_dir() -> string {
+    let p: string = env("ALEF_TODO_DIR")
+    if p == "None" {
+        return "~/.alef-todo"
+    }
+    return p
+}
+
+fn db_path() -> string {
+    return db_dir() + "/db.json"
+}
+
+fn session_path() -> string {
+    return db_dir() + "/session"
+}
+
+fn read_session() -> string {
+    let p = session_path()
+    if not exists(p) {
+        return ""
+    }
+    return read(p)
+}
+
+fn write_session(token: string) {
+    write(session_path(), token)
+}
+
+fn clear_session() {
+    let p = session_path()
+    if exists(p) {
+        write(p, "")
+    }
+}
+
+fn ensure_dir() {
+    // The db.store() will lazily create the file,
+    // but a real multi-user deployment wants the
+    // directory to exist up front. We use a tiny
+    // sentinel write: if ALEF_TODO_DIR/db.json
+    // doesn't exist, create the parent via std.fs
+    // (write an empty placeholder to the directory
+    // path itself, which fails on a missing dir).
+    //
+    // Actually std.fs doesn't expose mkdir. We rely
+    // on the OS to accept the open() call when
+    // db.store() runs — the dir is created by a
+    // typical fs.writeFile to a path inside it.
+    // So no-op here.
+}
+
+fn now() -> string {
+    // The v1 stdlib doesn't have a clock builtin.
+    // We use a simple epoch counter based on the
+    // monotonic counter pattern: each call returns
+    // the previous value + 1. The first call
+    // returns "1". This is fine for ordering todos
+    // within a process; cross-process ordering is
+    // out of scope for the v1 single-process CLI.
+    // We use a closure over a counter cell.
+    return now_tick()
+}
+
+// v1 has no mutable global, so we approximate now
+// with a process-static counter. The closure trick
+// is over-engineered for our purpose; the simpler
+// approach is to read the timestamp from a tiny
+// helper file the wrapper writes. But for v1 we
+// just use a string built from random_id — the
+// timestamp is only used for display ordering
+// ("created at"), not for any cross-process sync.
+//
+// To keep things deterministic in tests, we use
+// crypto.random_id() as a unique "now" value. The
+// value is meaningless as a timestamp; the visible
+// ordering just uses the ID.
+fn now_tick() -> string {
+    return random_id()
+}
+
+// ---------- help / error helpers ----------
+
+fn help() {
+    print("alef-todo: a multi-user, team-shared CLI todo app\n")
+    print("\n")
+    print("account:\n")
+    print("  register <name> <password>\n")
+    print("  login <name> <password>\n")
+    print("  logout\n")
+    print("  whoami\n")
+    print("\n")
+    print("teams:\n")
+    print("  team create <name>\n")
+    print("  team members <team_id>\n")
+    print("  team join <team_id>\n")
+    print("\n")
+    print("todos:\n")
+    print("  add <text...> [--team <team_id>]\n")
+    print("  list [--team <team_id>] [--all]\n")
+    print("  done <id>\n")
+    print("  remove <id>\n")
+    print("  share <todo_id> <user_id>\n")
+    print("\n")
+    print("data: " + db_path() + "\n")
+    print("session: " + session_path() + "\n")
+}
+
+fn die(msg: string) {
+    print("error: " + msg + "\n")
+    exit(1)
+}
+
+// ---------- auth ----------
+
+fn find_user_by_name(db: Struct, name: string) -> Struct {
+    // Returns the user struct or a Struct with id=0
+    // (the v1 sentinel for "not found"; we don't
+    // use null because field access on null
+    // crashes).
+    let id_key = "users_by_name." + name
+    if not has(db, id_key) {
+        return Struct { id: 0, name: "", pass_hash: "" }
+    }
+    let id = get(db, id_key)
+    return get(db, "users." + id)
+}
+
+fn require_user(db: Struct) -> Struct {
+    let token = read_session()
+    if str_len(token) == 0 {
+        die("not logged in (run `alef-todo login <name> <password>`)")
+    }
+    if not has(db, "tokens." + token) {
+        die("session token is invalid (run `alef-todo login ...`)")
+    }
+    let uid = get(db, "tokens." + token)
+    if not has(db, "users." + uid) {
+        die("session token refers to a missing user")
+    }
+    return get(db, "users." + uid)
+}
+
+fn current_user_id(db: Struct) -> string {
+    // Returns the active user id, or "0" if no
+    // valid session. The lib_* functions use this
+    // to avoid `die()` on auth failure — they
+    // emit a JSON error envelope instead. The
+    // cmd_* functions keep using `require_user`
+    // because die() is the right shape for a CLI.
+    let token = read_session()
+    if str_len(token) == 0 { return "0" }
+    if not has(db, "tokens." + token) { return "0" }
+    return get(db, "tokens." + token)
+}
+
+// ---------- commands: auth ----------
+
+fn cmd_register(db: Struct, name: string, password: string) {
+    if str_len(name) == 0 {
+        die("register: name must be non-empty")
+    }
+    if str_len(password) < 4 {
+        die("register: password must be at least 4 characters")
+    }
+    if has(db, "users_by_name." + name) {
+        die("register: name '" + name + "' is already taken")
+    }
+    let id = random_id()
+    let pass_hash = hash_password(password)
+    set(db, "users." + id, Struct { id: id, name: name, pass_hash: pass_hash })
+    set(db, "users_by_name." + name, id)
+    print("registered user #" + id + ": " + name + "\n")
+}
+
+fn cmd_login(db: Struct, name: string, password: string) {
+    let u = find_user_by_name(db, name)
+    if u.id == 0 {
+        die("login: no such user '" + name + "'")
+    }
+    if not verify_password(password, u.pass_hash) {
+        die("login: incorrect password")
+    }
+    let token = random_id()
+    set(db, "tokens." + token, u.id)
+    write_session(token)
+    print("logged in as " + name + " (#" + u.id + ")\n")
+}
+
+fn cmd_logout(db: Struct) {
+    let token = read_session()
+    if str_len(token) > 0 {
+        if has(db, "tokens." + token) {
+            delete(db, "tokens." + token)
+        }
+    }
+    clear_session()
+    print("logged out\n")
+}
+
+fn cmd_whoami(db: Struct) {
+    let u = require_user(db)
+    print(u.name + " (#" + u.id + ")\n")
+}
+
+// ---------- commands: teams ----------
+
+fn cmd_team_create(db: Struct, name: string) {
+    let u = require_user(db)
+    if str_len(name) == 0 {
+        die("team create: name must be non-empty")
+    }
+    if has(db, "teams_by_name." + name) {
+        die("team create: name '" + name + "' is already taken")
+    }
+    let id = random_id()
+    set(db, "teams." + id, Struct { id: id, name: name, owner_id: u.id, created_at: now_tick() })
+    set(db, "teams_by_name." + name, id)
+    // Owner is automatically a member with role=owner.
+    set(db, "team_members." + id + "." + u.id, Struct { role: "owner" })
+    print("created team #" + id + ": " + name + "\n")
+}
+
+fn cmd_team_members(db: Struct, team_id: string) {
+    let prefix = "team_members." + team_id + "."
+    let all = keys(db)
+    print("members of team " + team_id + ":\n")
+    let found = false
+    for k in all {
+        // v1 strings don't have startsWith; we
+        // compare the prefix slice via JSON. Round-
+        // tripping is heavy but v1 has no
+        // startsWith. We use the cheaper check: a
+        // direct equality on the prefix by encoding
+        // the key and slicing.
+        // v1 string ops: slice(start, end), so
+        // k.slice(0, str_len(prefix)) == prefix.
+        if k.slice(0, str_len(prefix)) == prefix {
+            let uid = k.slice(str_len(prefix), str_len(k))
+            let u = get(db, "users." + uid)
+            if u.id != 0 {
+                let m = get(db, k)
+                print("  " + u.name + " (#" + uid + ") [" + m.role + "]\n")
+                found = true
+            }
+        }
+    }
+    if not found {
+        print("  (no members)\n")
+    }
+}
+
+fn cmd_team_join(db: Struct, team_id: string) {
+    let u = require_user(db)
+    if not has(db, "teams." + team_id) {
+        die("team join: no such team #" + team_id)
+    }
+    if has(db, "team_members." + team_id + "." + u.id) {
+        die("team join: you are already a member of this team")
+    }
+    set(db, "team_members." + team_id + "." + u.id, Struct { role: "member" })
+    print("joined team " + team_id + " as member\n")
+}
+
+// ---------- ACL ----------
+
+fn is_team_member(db: Struct, team_id: string, user_id: string) -> bool {
+    return has(db, "team_members." + team_id + "." + user_id)
+}
+
+fn can_see_todo(db: Struct, u: Struct, t: Struct) -> bool {
+    // A user can see a todo if any of:
+    //   - they own it (owner_id == u.id)
+    //   - it's a team todo and they're a member
+    //   - they appear in `shares`
+    if t.owner_id == u.id {
+        return true
+    }
+    // team_id is optional; Alef doesn't have
+    // Optional, so we encode as empty string when
+    // absent. Empty team_id means "personal todo".
+    if str_len(t.team_id) > 0 {
+        if is_team_member(db, t.team_id, u.id) {
+            return true
+        }
+    }
+    if has(db, "shares." + t.id + "." + u.id) {
+        return true
+    }
+    return false
+}
+
+fn can_modify_todo(db: Struct, u: Struct, t: Struct) -> bool {
+    if t.owner_id == u.id {
+        return true
+    }
+    if str_len(t.team_id) > 0 {
+        if is_team_member(db, t.team_id, u.id) {
+            return true
+        }
+    }
+    return false
+}
+
+fn can_modify(db: Struct, t: Struct, user_id: string) -> bool {
+    // Slim variant for the lib_* path: takes the
+    // user id directly instead of resolving a
+    // user struct. The two are equivalent — the
+    // shape `u.id == t.owner_id` is the only
+    // relevant comparison — but the lib layer
+    // already has the id, so we don't pay the
+    // extra get().
+    if t.owner_id == user_id { return true }
+    if str_len(t.team_id) > 0 {
+        if is_team_member(db, t.team_id, user_id) { return true }
+    }
+    return false
+}
+
+fn visible_to(db: Struct, todo_id: string, t: Struct, user_id: string, team_filter: string, all: bool) -> bool {
+    if all { return true }
+    if t.owner_id == user_id { return true }
+    if str_len(team_filter) > 0 {
+        if t.team_id == team_filter {
+            if is_team_member(db, team_filter, user_id) { return true }
+        }
+    } else if str_len(t.team_id) > 0 {
+        if is_team_member(db, t.team_id, user_id) { return true }
+    }
+    if has(db, "shares." + todo_id + "." + user_id) { return true }
+    return false
+}
+
+// ---------- commands: todos ----------
+
+fn cmd_add(db: Struct, text: string, team_id: string) {
+    let u = require_user(db)
+    if str_len(text) == 0 {
+        die("add: text must be non-empty")
+    }
+    if str_len(team_id) > 0 {
+        if not has(db, "teams." + team_id) {
+            die("add: no such team #" + team_id)
+        }
+        if not is_team_member(db, team_id, u.id) {
+            die("add: you are not a member of team " + team_id)
+        }
+    }
+    let id = random_id()
+    set(db, "todos." + id, Struct {
+        id: id,
+        owner_id: u.id,
+        team_id: team_id,
+        text: text,
+        done: false,
+        created_at: now_tick(),
+    })
+    let scope = "personal"
+    if str_len(team_id) > 0 {
+        scope = "team:" + team_id
+    }
+    print("added #" + id + " (" + scope + "): " + text + "\n")
+}
+
+fn cmd_list(db: Struct, team_id: string, all: bool) {
+    let u = require_user(db)
+    let all_keys = keys(db)
+    let n = 0
+    for k in all_keys {
+        // keys that start with "todos."
+        if k.slice(0, 6) == "todos." {
+            let t = get(db, k)
+            if can_see_todo(db, u, t) {
+                // Optional team_id filter
+                if str_len(team_id) > 0 {
+                    if t.team_id != team_id {
+                        continue
+                    }
+                } else if not all {
+                    // Default: hide other people's
+                    // personal todos (which are
+                    // already filtered by
+                    // can_see_todo) but show all
+                    // team todos and shared todos.
+                    // can_see_todo already restricted
+                    // to the right set; the
+                    // `--all` flag here only controls
+                    // whether to also include todos
+                    // shared with me via `shares`.
+                    // Currently can_see_todo includes
+                    // those, so `--all` is a no-op
+                    // reserved for v1.1 when we
+                    // distinguish "todos in teams I
+                    // joined" from "todos shared
+                    // directly with me".
+                }
+                let marker = "[ ]"
+                if t.done {
+                    marker = "[x]"
+                }
+                let scope = ""
+                if str_len(t.team_id) > 0 {
+                    scope = " (team:" + t.team_id + ")"
+                } else {
+                    let owner = get(db, "users." + t.owner_id)
+                    if owner.id == u.id {
+                        scope = " (you)"
+                    } else {
+                        scope = " (from " + owner.name + ")"
+                    }
+                }
+                print(marker + " #" + t.id + scope + " " + t.text + "\n")
+                n = n + 1
+            }
+        }
+    }
+    if n == 0 {
+        print("(no todos)\n")
+    }
+}
+
+fn cmd_done(db: Struct, todo_id: string) {
+    let u = require_user(db)
+    if not has(db, "todos." + todo_id) {
+        die("done: no such todo #" + todo_id)
+    }
+    let t = get(db, "todos." + todo_id)
+    if not can_modify_todo(db, u, t) {
+        die("done: you don't have permission to modify this todo")
+    }
+    // Mark done by rewriting the struct with
+    // done=true. v1 doesn't have a struct
+    // field-assign, so we remove + re-set.
+    delete(db, "todos." + todo_id)
+    set(db, "todos." + todo_id, Struct {
+        id: t.id,
+        owner_id: t.owner_id,
+        team_id: t.team_id,
+        text: t.text,
+        done: true,
+        created_at: t.created_at,
+    })
+    print("done #" + todo_id + "\n")
+}
+
+fn cmd_remove(db: Struct, todo_id: string) {
+    let u = require_user(db)
+    if not has(db, "todos." + todo_id) {
+        die("remove: no such todo #" + todo_id)
+    }
+    let t = get(db, "todos." + todo_id)
+    if not can_modify_todo(db, u, t) {
+        die("remove: you don't have permission to remove this todo")
+    }
+    delete(db, "todos." + todo_id)
+    // Clean up the shares map for this todo.
+    let share_prefix = "shares." + todo_id + "."
+    let all = keys(db)
+    for k in all {
+        if k.slice(0, str_len(share_prefix)) == share_prefix {
+            delete(db, k)
+        }
+    }
+    print("removed #" + todo_id + "\n")
+}
+
+fn cmd_share(db: Struct, todo_id: string, user_id: string) {
+    let u = require_user(db)
+    if not has(db, "todos." + todo_id) {
+        die("share: no such todo #" + todo_id)
+    }
+    if not has(db, "users." + user_id) {
+        die("share: no such user #" + user_id)
+    }
+    let t = get(db, "todos." + todo_id)
+    if t.owner_id != u.id {
+        die("share: only the owner can share a todo")
+    }
+    set(db, "shares." + todo_id + "." + user_id, Struct {})
+    print("shared #" + todo_id + " with user " + user_id + "\n")
+}
+
+// ---------- lib mode: JSON-shape dispatch ----------
+//
+// lib mode is the IPC entry point used by tests,
+// scripts, and (in v1.1) a thin TS web server.
+// Each lib_* function writes exactly one JSON line
+// to stdout:
+//   {"ok":true,"result":<value>}
+//   {"ok":false,"err":"<message>"}
+//
+// Alef string interpolation treats `{` as a
+// template opener, so we cannot write raw `{}`
+// braces in a string literal — the lexer would
+// try to start an interpolation. We work around
+// this by encoding all results through
+// `std.json.encode`, which produces a real JSON
+// string at runtime from an Alef value. That way
+// we never need to type literal `{}` in a string.
+//
+// The lib_* functions share their business logic
+// with the cmd_* functions above. Where cmd_*
+// prints human-readable output and `die()`s on
+// failure, lib_* returns a JSON result. We do not
+// try to recover from die() in lib mode — each
+// branch checks the precondition explicitly and
+// lib_fail()s on its own.
+
+fn lib_fail(msg: string) {
+    // Alef's string interpolation makes raw braces
+    // impossible to type in a string literal. We
+    // work around it by encoding the entire
+    // envelope as a Struct, then emitting it as a
+    // single JSON string via std.json.encode.
+    let env = Struct { ok: false, err: msg }
+    print(encode(env) + "\n")
+}
+
+fn lib_ok(value: Struct) {
+    let env = Struct { ok: true, result: value }
+    print(encode(env) + "\n")
+}
+
+fn lib_ok_str(s: string) {
+    let env = Struct { ok: true, result: s }
+    print(encode(env) + "\n")
+}
+
+fn lib_register(db: Struct, name: string, password: string) {
+    if str_len(name) == 0 {
+        lib_fail("register: name must be non-empty")
+        return
+    }
+    if has(db, "users_by_name." + name) {
+        lib_fail("register: name '" + name + "' is already taken")
+        return
+    }
+    let id = random_id()
+    let pass_hash = hash_password(password)
+    set(db, "users." + id, Struct { id: id, name: name, pass_hash: pass_hash })
+    set(db, "users_by_name." + name, id)
+    lib_ok(Struct { id: id, name: name })
+}
+
+fn lib_login(db: Struct, name: string, password: string) {
+    if not has(db, "users_by_name." + name) {
+        lib_fail("login: no such user '" + name + "'")
+        return
+    }
+    let id = get(db, "users_by_name." + name)
+    let u = get(db, "users." + id)
+    if not verify_password(password, u.pass_hash) {
+        lib_fail("login: incorrect password")
+        return
+    }
+    let token = random_id()
+    set(db, "tokens." + token, id)
+    write_session(token)
+    lib_ok(Struct { id: id, name: name })
+}
+
+fn lib_logout(db: Struct) {
+    let token = read_session()
+    if str_len(token) > 0 {
+        if has(db, "tokens." + token) {
+            delete(db, "tokens." + token)
+        }
+    }
+    clear_session()
+    lib_ok_str("logged out")
+}
+
+fn lib_whoami(db: Struct) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    let u = get(db, "users." + u_id)
+    lib_ok(Struct { id: u_id, name: u.name })
+}
+
+fn lib_team_create(db: Struct, name: string) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    if str_len(name) == 0 {
+        lib_fail("team_create: name must be non-empty")
+        return
+    }
+    if has(db, "teams_by_name." + name) {
+        lib_fail("team_create: name '" + name + "' is already taken")
+        return
+    }
+    let id = random_id()
+    set(db, "teams." + id, Struct { id: id, name: name, owner_id: u_id, created_at: now_tick() })
+    set(db, "teams_by_name." + name, id)
+    set(db, "team_members." + id + "." + u_id, Struct { role: "owner" })
+    lib_ok(Struct { id: id, name: name })
+}
+
+fn lib_team_join(db: Struct, team_id: string) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    if not has(db, "teams." + team_id) {
+        lib_fail("team_join: no such team '" + team_id + "'")
+        return
+    }
+    set(db, "team_members." + team_id + "." + u_id, Struct { role: "member" })
+    lib_ok_str("joined")
+}
+
+fn lib_team_members(db: Struct, team_id: string) {
+    if not has(db, "teams." + team_id) {
+        lib_fail("team_members: no such team '" + team_id + "'")
+        return
+    }
+    let prefix = "team_members." + team_id + "."
+    let all = keys(db)
+    let result = "["
+    let first = true
+    for k in all {
+        if k.slice(0, str_len(prefix)) == prefix {
+            let uid = k.slice(str_len(prefix), str_len(k))
+            if has(db, "users." + uid) {
+                let u = get(db, "users." + uid)
+                let member = get(db, k)
+                let sep = ","
+                if first {
+        sep = ""
+        first = false
+    }
+                // We assemble the array element via
+                // std.json.encode, which handles all
+                // the escaping. The trick: the
+                // separator and the encoded object
+                // both come from string concat, so
+                // we never have a raw `{}` in
+                // source.
+                result = result + sep + encode(Struct { id: uid, name: u.name, role: member.role })
+            }
+        }
+    }
+    result = result + "]"
+    let env = Struct { ok: true, result: result }
+    print(encode(env) + "\n")
+}
+
+fn lib_add(db: Struct, text: string, team_id: string) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    if str_len(text) == 0 {
+        lib_fail("add: text must be non-empty")
+        return
+    }
+    if str_len(team_id) > 0 {
+        if not has(db, "teams." + team_id) {
+        lib_fail("add: no such team '" + team_id + "'")
+        return
+    }
+        if not is_team_member(db, team_id, u_id) {
+        lib_fail("add: not a member of team '" + team_id + "'")
+        return
+    }
+    }
+    let id = random_id()
+    set(db, "todos." + id, Struct { id: id, owner_id: u_id, team_id: team_id, text: text, done: false, created_at: now_tick() })
+    lib_ok(Struct { id: id })
+}
+
+fn lib_list(db: Struct, team_id: string, all: bool) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    let all_keys = keys(db)
+    let result = "["
+    let first = true
+    for k in all_keys {
+        if k.slice(0, 6) == "todos." {
+            let tid = k.slice(6, str_len(k))
+            if str_len(tid) == 0 { continue }
+            if has(db, "todos." + tid) {
+                let t = get(db, "todos." + tid)
+                if visible_to(db, tid, t, u_id, team_id, all) {
+                    let sep = ","
+                    if first {
+        sep = ""
+        first = false
+    }
+                    // Build the todo as a Struct
+                    // without optional fields by
+                    // using empty-string for missing
+                    // values. std.json.encode
+                    // serializes the Struct as a
+                    // JSON object.
+                    result = result + sep + todo_to_json(t)
+                }
+            }
+        }
+    }
+    result = result + "]"
+    let env = Struct { ok: true, result: result }
+    print(encode(env) + "\n")
+}
+
+fn todo_to_json(t: Struct) -> string {
+    // We want team_id to be a JSON null when empty
+    // and a string otherwise. Alef doesn't have
+    // nullable strings, so we wrap in a Struct
+    // and rely on the stdlib to emit JSON
+    // faithfully. For null we pass the string
+    // "null" as a marker and post-process: a
+    // lighter alternative is to use a two-field
+    // Struct that always serializes the same way.
+    // The cleanest approach: hand-build a tiny
+    // JSON object with std.json.encode, accepting
+    // that team_id will be a string even when
+    // empty. Empty team_id means "personal todo"
+    // in the rest of the codebase.
+    return encode(t)
+}
+
+fn lib_done(db: Struct, todo_id: string) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    if not has(db, "todos." + todo_id) {
+        lib_fail("done: no such todo '" + todo_id + "'")
+        return
+    }
+    let t = get(db, "todos." + todo_id)
+    if not can_modify(db, t, u_id) {
+        lib_fail("done: not allowed")
+        return
+    }
+    set(db, "todos." + todo_id, Struct { id: t.id, owner_id: t.owner_id, team_id: t.team_id, text: t.text, done: true, created_at: t.created_at })
+    lib_ok_str("done")
+}
+
+fn lib_remove(db: Struct, todo_id: string) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    if not has(db, "todos." + todo_id) {
+        lib_fail("remove: no such todo '" + todo_id + "'")
+        return
+    }
+    let t = get(db, "todos." + todo_id)
+    if not can_modify(db, t, u_id) {
+        lib_fail("remove: not allowed")
+        return
+    }
+    delete(db, "todos." + todo_id)
+    let pref = "shares." + todo_id + "."
+    let all = keys(db)
+    for k in all {
+        if k.slice(0, str_len(pref)) == pref {
+            delete(db, k)
+        }
+    }
+    lib_ok_str("removed")
+}
+
+fn lib_share(db: Struct, todo_id: string, user_id: string) {
+    let u_id = current_user_id(db)
+    if u_id == "0" {
+        lib_fail("not logged in")
+        return
+    }
+    if not has(db, "todos." + todo_id) {
+        lib_fail("share: no such todo '" + todo_id + "'")
+        return
+    }
+    if not has(db, "users." + user_id) {
+        lib_fail("share: no such user '" + user_id + "'")
+        return
+    }
+    let t = get(db, "todos." + todo_id)
+    if t.owner_id != u_id {
+        lib_fail("share: only the owner can share a todo")
+        return
+    }
+    set(db, "shares." + todo_id + "." + user_id, Struct {})
+    lib_ok_str("shared")
+}
+// ---------- entry point ----------
+
+fn main() {
+    ensure_dir()
+    let db = store(db_path())
+    let a = argv()
+    let n = argv_len(a)
+    if n < 3 {
+        help()
+        return
+    }
+    let cmd = a[2]
+    // v1's `else if` chain has a parser quirk
+    // (the trailing `else` fires after a match),
+    // so we use `match` for command dispatch.
+    if cmd == "lib" {
+        // lib mode: program-friendly dispatch. Each
+        // lib call writes a single-line JSON object
+        // to stdout suitable for `child_process` IPC
+        // from a TS web server, a test harness, or
+        // any other consumer. Errors are JSON too:
+        //   {"ok":false,"err":"..."}
+        // Successes are:
+        //   {"ok":true,"result":<value>}
+        if n < 4 {
+            lib_fail("lib <method> <args...>")
+        }
+        let method = a[3]
+        match method {
+            "register" => {
+                if n < 6 {
+                    lib_fail("lib register <name> <password>")
+                    return
+                }
+                lib_register(db, a[4], a[5])
+            }
+            "login" => {
+                if n < 6 {
+                    lib_fail("lib login <name> <password>")
+                    return
+                }
+                lib_login(db, a[4], a[5])
+            }
+            "logout" => {
+                lib_logout(db)
+            }
+            "whoami" => {
+                lib_whoami(db)
+            }
+            "team_create" => {
+                if n < 5 {
+                    lib_fail("lib team_create <name>")
+                    return
+                }
+                lib_team_create(db, a[4])
+            }
+            "team_join" => {
+                if n < 5 {
+                    lib_fail("lib team_join <team_id>")
+                    return
+                }
+                lib_team_join(db, a[4])
+            }
+            "team_members" => {
+                if n < 5 {
+                    lib_fail("lib team_members <team_id>")
+                    return
+                }
+                lib_team_members(db, a[4])
+            }
+            "add" => {
+                if n < 5 {
+                    lib_fail("lib add <text...>")
+                    return
+                }
+                let team_id = ""
+                let text_end = n
+                if n > 6 {
+                    if a[n - 2] == "--team" {
+                        team_id = a[n - 1]
+                        text_end = n - 2
+                    }
+                }
+                let text = join_args(a, 4, text_end)
+                lib_add(db, text, team_id)
+            }
+            "list" => {
+                let team_id = ""
+                let all = false
+                if n > 4 {
+                    let flag = a[4]
+                    if flag == "--team" {
+                        if n < 6 {
+                            lib_fail("lib list: --team requires an argument")
+                            return
+                        }
+                        team_id = a[5]
+                    } else {
+                        if flag == "--all" {
+                            all = true
+                        } else {
+                            lib_fail("lib list: unknown flag '" + flag + "'")
+                            return
+                        }
+                    }
+                }
+                if n > 6 {
+                    let flag = a[6]
+                    if flag == "--team" {
+                        if n < 8 {
+                            lib_fail("lib list: --team requires an argument")
+                            return
+                        }
+                        team_id = a[7]
+                    } else {
+                        if flag == "--all" {
+                            all = true
+                        } else {
+                            lib_fail("lib list: unknown flag '" + flag + "'")
+                            return
+                        }
+                    }
+                }
+                lib_list(db, team_id, all)
+            }
+            "done" => {
+                if n < 5 {
+                    lib_fail("lib done <id>")
+                    return
+                }
+                lib_done(db, a[4])
+            }
+            "remove" => {
+                if n < 5 {
+                    lib_fail("lib remove <id>")
+                    return
+                }
+                lib_remove(db, a[4])
+            }
+            "share" => {
+                if n < 6 {
+                    lib_fail("lib share <todo_id> <user_id>")
+                    return
+                }
+                lib_share(db, a[4], a[5])
+            }
+            _ => {
+                lib_fail("lib: unknown method '" + method + "'")
+            }
+        }
+        return
+    }
+    match cmd {
+        "register" => {
+            if n < 5 {
+                die("register <name> <password>")
+            }
+            cmd_register(db, a[3], a[4])
+        }
+        "login" => {
+            if n < 5 {
+                die("login <name> <password>")
+            }
+            cmd_login(db, a[3], a[4])
+        }
+        "logout" => {
+            cmd_logout(db)
+        }
+        "whoami" => {
+            cmd_whoami(db)
+        }
+        "team" => {
+            if n < 5 {
+                die("team <create|members|join> ...")
+            }
+            let sub = a[3]
+            match sub {
+                "create" => {
+                    if n < 5 {
+                        die("team create <name>")
+                    }
+                    cmd_team_create(db, a[4])
+                }
+                "members" => {
+                    if n < 5 {
+                        die("team members <team_id>")
+                    }
+                    cmd_team_members(db, a[4])
+                }
+                "join" => {
+                    if n < 5 {
+                        die("team join <team_id>")
+                    }
+                    cmd_team_join(db, a[4])
+                }
+                _ => {
+                    die("team: unknown subcommand '" + sub + "'")
+                }
+            }
+        }
+        "add" => {
+            // add <text...> [--team <team_id>]
+            // The text spans a[3..team_flag-1] (or
+            // a[3..n-1] if no --team flag). The
+            // --team flag, if present, is the last
+            // argument.
+            if n < 4 {
+                die("add <text...>")
+            }
+            let team_id = ""
+            let text_end = n
+            if n > 5 {
+                if a[n - 2] == "--team" {
+                    team_id = a[n - 1]
+                    text_end = n - 2
+                }
+            }
+            let text = join_args(a, 3, text_end)
+            cmd_add(db, text, team_id)
+        }
+        "list" => {
+            // list [--team <team_id>] [--all]
+            let team_id = ""
+            let all = false
+            let i = 3
+            while i < n {
+                if a[i] == "--team" {
+                    if i + 1 == n {
+                        die("list: --team requires an argument")
+                    }
+                    team_id = a[i + 1]
+                    i = i + 2
+                } else if a[i] == "--all" {
+                    all = true
+                    i = i + 1
+                } else {
+                    die("list: unknown flag '" + a[i] + "'")
+                }
+            }
+            cmd_list(db, team_id, all)
+        }
+        "done" => {
+            if n < 4 {
+                die("done <id>")
+            }
+            cmd_done(db, a[3])
+        }
+        "remove" => {
+            if n < 4 {
+                die("remove <id>")
+            }
+            cmd_remove(db, a[3])
+        }
+        "share" => {
+            if n < 5 {
+                die("share <todo_id> <user_id>")
+            }
+            cmd_share(db, a[3], a[4])
+        }
+        "help" => {
+            help()
+        }
+        _ => {
+            print("unknown command: " + cmd + "\n")
+            help()
+            exit(1)
+        }
+    }
+    close(db)
+}
