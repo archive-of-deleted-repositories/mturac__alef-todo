@@ -986,13 +986,11 @@ fn main() {
                             return
                         }
                         team_id = a[5]
+                    } else if flag == "--all" {
+                        all = true
                     } else {
-                        if flag == "--all" {
-                            all = true
-                        } else {
-                            lib_fail("lib list: unknown flag '" + flag + "'")
-                            return
-                        }
+                        lib_fail("lib list: unknown flag '" + flag + "'")
+                        return
                     }
                 }
                 if n > 6 {
@@ -1003,13 +1001,11 @@ fn main() {
                             return
                         }
                         team_id = a[7]
+                    } else if flag == "--all" {
+                        all = true
                     } else {
-                        if flag == "--all" {
-                            all = true
-                        } else {
-                            lib_fail("lib list: unknown flag '" + flag + "'")
-                            return
-                        }
+                        lib_fail("lib list: unknown flag '" + flag + "'")
+                        return
                     }
                 }
                 lib_list(db, team_id, all)
