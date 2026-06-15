@@ -61,6 +61,7 @@ import std.fs { exists, read, write }
 import std.json { encode, decode }
 import std.crypto { hash_password, verify_password, random_id }
 import std.db { store, get, set, has, delete, keys, close }
+import std.string { starts_with, len }
 
 // ---------- path / session ----------
 
@@ -327,8 +328,8 @@ fn cmd_team_members(db: Struct, team_id: string) {
         // the key and slicing.
         // v1 string ops: slice(start, end), so
         // k.slice(0, str_len(prefix)) == prefix.
-        if k.slice(0, str_len(prefix)) == prefix {
-            let uid = k.slice(str_len(prefix), str_len(k))
+        if starts_with(k, prefix) {
+            let uid = k.slice(str_len(prefix), len(k))
             let u = get(db, "users." + uid)
             if u.id != 0 {
                 let m = get(db, k)
@@ -460,7 +461,7 @@ fn cmd_list(db: Struct, team_id: string, all: bool) {
     let n = 0
     for k in all_keys {
         // keys that start with "todos."
-        if k.slice(0, 6) == "todos." {
+        if starts_with(k, "todos.") {
             let t = get(db, k)
             if can_see_todo(db, u, t) {
                 // Optional team_id filter
@@ -549,7 +550,7 @@ fn cmd_remove(db: Struct, todo_id: string) {
     let share_prefix = "shares." + todo_id + "."
     let all = keys(db)
     for k in all {
-        if k.slice(0, str_len(share_prefix)) == share_prefix {
+        if starts_with(k, share_prefix) {
             delete(db, k)
         }
     }
@@ -717,8 +718,8 @@ fn lib_team_members(db: Struct, team_id: string) {
     let result = "["
     let first = true
     for k in all {
-        if k.slice(0, str_len(prefix)) == prefix {
-            let uid = k.slice(str_len(prefix), str_len(k))
+        if starts_with(k, prefix) {
+            let uid = k.slice(str_len(prefix), len(k))
             if has(db, "users." + uid) {
                 let u = get(db, "users." + uid)
                 let member = get(db, k)
@@ -778,8 +779,8 @@ fn lib_list(db: Struct, team_id: string, all: bool) {
     let result = "["
     let first = true
     for k in all_keys {
-        if k.slice(0, 6) == "todos." {
-            let tid = k.slice(6, str_len(k))
+        if starts_with(k, "todos.") {
+            let tid = k.slice(6, len(k))
             if str_len(tid) == 0 { continue }
             if has(db, "todos." + tid) {
                 let t = get(db, "todos." + tid)
@@ -860,7 +861,7 @@ fn lib_remove(db: Struct, todo_id: string) {
     let pref = "shares." + todo_id + "."
     let all = keys(db)
     for k in all {
-        if k.slice(0, str_len(pref)) == pref {
+        if starts_with(k, pref) {
             delete(db, k)
         }
     }
